@@ -21,7 +21,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DATA_FILE = os.environ.get("WATTWRIGHT_DATA", "wattwright.json")
 UNIT_PATH = "/etc/systemd/system/wattwright.service"
 
@@ -57,7 +57,13 @@ def _num(x: str) -> float | None:
 
 
 def sample(indexes: list[int]) -> list[dict]:
-    """One reading of clock, watts, temperature and fan for every GPU."""
+    """One reading of clock, watts, temperature and fan for every GPU.
+
+    Raises if a GPU does not answer at all. Silence is not coolness: when
+    `nvidia-smi` fails this used to return an empty list, `too_hot([])` said
+    None, and the temperature limit quietly stopped existing - exactly when the
+    telemetry breaking should have made us more careful, not less.
+    """
     fields = "index,clocks.gr,power.draw,temperature.gpu,fan.speed"
     read = []
     for row in _smi(f"--query-gpu={fields}", "--format=csv,noheader,nounits").splitlines():
@@ -66,6 +72,9 @@ def sample(indexes: list[int]) -> list[dict]:
             continue
         read.append({"i": int(p[0]), "clock": _num(p[1]), "watt": _num(p[2]),
                      "temp": _num(p[3]), "fan": _num(p[4])})
+    absent = sorted(set(indexes) - {g["i"] for g in read})
+    if absent:
+        raise RuntimeError(f"no telemetry from GPU {absent}: is nvidia-smi failing?")
     return read
 
 
@@ -96,8 +105,10 @@ def clock_lock(indexes: list[int], mhz: int | None) -> None:
         (errors if err else done).append(err or i)
     if errors:
         if mhz is not None:                       # roll the partial lock back
-            for i in done:
-                _lock_one(i, None)
+            back = [e for e in (_lock_one(i, None) for i in done) if e]
+            if back:
+                errors.append("AND the rollback failed: " + "; ".join(back)
+                              + " - run `nvidia-smi -rgc` as root")
         raise RuntimeError("; ".join(errors))
 
 
@@ -222,6 +233,8 @@ class Load:
                         self._error = f"{type(e).__name__}: {e}"
                     time.sleep(2)
 
+        with self._lock:
+            self._error = None     # a new thread does not inherit the old one's failure
         self._stop.clear()
         self._thread = threading.Thread(target=loop, name="wattwright-load", daemon=True)
         self._thread.start()
@@ -374,7 +387,11 @@ def cmd_measure(a) -> int:
         try:
             load.start()
             print("warming up for 60 s before the first point...", file=sys.stderr)
-            watch(indexes, 60, load)
+            try:
+                watch(indexes, 60, load)
+            except RuntimeError as e:
+                print(f"cannot even warm up: {e}", file=sys.stderr)
+                return 1
             for mhz in [None] + list(a.clock):
                 label = "free" if mhz is None else f"{mhz} MHz"
                 print(f"  point {label} (settling {a.settle} s)...", file=sys.stderr, flush=True)
@@ -382,9 +399,16 @@ def cmd_measure(a) -> int:
                     point = measure_point(indexes, load, mhz, a.settle, a.window)
                 except RuntimeError as e:
                     print(f"  ! {e} - point dropped", file=sys.stderr)
-                    unlock_all(indexes)        # never carry a lock into the next point
+                    failed = unlock_all(indexes)   # never carry a lock into the next point
+                    if failed:
+                        print("  ! could not free the clocks: " + "; ".join(failed)
+                              + " - run `nvidia-smi -rgc` as root", file=sys.stderr)
                     if not load.running:
                         load.start()
+                    continue
+                if point["tps"] is None:
+                    print("  ! no request finished inside the sampling window "
+                          f"(try --window above {a.window}) - point dropped", file=sys.stderr)
                     continue
                 point["prefill_tps"] = measure_prefill(load, long_prompt)
                 points.append(point)
@@ -416,8 +440,11 @@ def measure_prefill(load: Load, prompt: str) -> float | None:
     """
     try:
         load.stop()
-        load.request(prompt, 8)                    # warm, then keep the second
-        value = Load.prefill_tps(load.request(prompt, 8))
+        # One token, not eight: without `timings` the rate is computed from the
+        # wall clock, so every generated token inflates the denominator and makes
+        # reading look slower than it is.
+        load.request(prompt, 1)                    # warm, then keep the second
+        value = Load.prefill_tps(load.request(prompt, 1))
         return round(value, 1) if value is not None else None
     except Exception as e:                                       # noqa: BLE001
         print(f"    (reading speed not measured: {type(e).__name__}: {e})", file=sys.stderr)
@@ -432,6 +459,13 @@ def measure_prefill(load: Load, prompt: str) -> float | None:
 
 # -------------------------------- profiles --------------------------------
 
+def _real(x) -> bool:
+    """A usable number. `json.load` happily accepts NaN and Infinity, which are
+    floats, pass every isinstance check, and then explode inside int()."""
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and x == x and x not in (float("inf"), float("-inf")))
+
+
 def usable_points(data: dict) -> list[dict]:
     """Only the points we can actually reason about, whatever the file contains.
 
@@ -439,18 +473,18 @@ def usable_points(data: dict) -> list[dict]:
     is treated as untrusted input rather than as something we wrote ourselves.
     """
     raw = data.get("points") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
     good = []
-    for p in raw or []:
+    for p in raw:
         if not isinstance(p, dict):
             continue
-        if not isinstance(p.get("tps"), (int, float)) or isinstance(p.get("tps"), bool):
-            continue
-        if not isinstance(p.get("watt_total"), (int, float)) or isinstance(p.get("watt_total"), bool):
+        if not _real(p.get("tps")) or not _real(p.get("watt_total")):
             continue
         if p["tps"] <= 0 or p["watt_total"] <= 0:
             continue
         clock = p.get("clock")
-        if clock is not None and (isinstance(clock, bool) or not isinstance(clock, (int, float))):
+        if clock is not None and (not _real(clock) or clock <= 0):
             continue
         good.append(p)
     return good
@@ -472,7 +506,8 @@ def derive(data: dict) -> dict[str, dict]:
     points = usable_points(data)
     if not points:
         return {}
-    unlocked = next((p for p in points if p.get("clock") is None), None)
+    free_runs = [p for p in points if p.get("clock") is None]
+    unlocked = max(free_runs, key=lambda p: p["tps"]) if free_runs else None
     reference = unlocked or max(points, key=lambda p: p["tps"])
     locked = sorted((p for p in points if p.get("clock") is not None),
                     key=lambda p: p["clock"])
@@ -515,19 +550,21 @@ def cmd_profiles(a) -> int:
         print("no usable point in the measurements", file=sys.stderr)
         return 1
     reference = prof.get("power") or max(prof.values(), key=lambda p: p["tps"])
-    gpus = [g for g in (data.get("gpu") or []) if isinstance(g, str)]
+    raw_gpu = data.get("gpu")
+    gpus = [g for g in raw_gpu if isinstance(g, str)] if isinstance(raw_gpu, list) else []
     print(f"measured {data.get('when', '?')} - {', '.join(gpus) or 'unknown GPU'} "
           f"- model {data.get('model', '?')}\n")
     if "power" not in prof:
         print("note: this file has no unlocked run, so percentages are relative to the\n"
               "      fastest measured point and there is no `power` profile.\n")
-    groups: dict[object, list[str]] = {}
-    for name, p in prof.items():        # one row per clock, every name that lands on it
-        groups.setdefault(p.get("clock"), []).append(name)
+    groups: dict[int, list[str]] = {}      # keyed by identity: two different points
+    for name, p in prof.items():           # at the same clock stay two different rows
+        groups.setdefault(id(p), []).append(name)
     print(f"{'profile':22} {'clock':>8} {'tok/s':>14} {'reading':>9} "
           f"{'watts':>13} {'C':>5} {'fan':>6}")
-    for clock_value, names in groups.items():
+    for names in groups.values():
         p = prof[names[0]]
+        clock_value = p.get("clock")
         share = f"{p['tps'] / reference['tps'] * 100:.0f}%"
         watts = f"{p['watt_total'] / reference['watt_total'] * 100:.0f}%"
         print(f"{' / '.join(names):22} "
@@ -570,9 +607,16 @@ def cmd_set(a) -> int:
     try:
         clock_lock(indexes, mhz)            # rolls itself back on a partial failure
     except RuntimeError as e:
+        # The message says exactly what happened, rollback included: claiming
+        # "clocks were put back" when the rollback also failed is a lie told in
+        # the one place where the user most needs the truth.
         print(f"could not apply the profile: {e}", file=sys.stderr)
-        print("clocks were put back the way they were.", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        failed = unlock_all(indexes)
+        print("\ninterrupted: clocks freed" if not failed
+              else "\ninterrupted, and freeing failed: " + "; ".join(failed), file=sys.stderr)
+        return 130
     print(f"profile {a.profile}: clock {'free' if mhz is None else str(mhz) + ' MHz'} "
           f"on GPU {', '.join(map(str, indexes))}")
     return 0

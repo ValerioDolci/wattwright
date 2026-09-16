@@ -28,7 +28,9 @@ ww = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ww)
 
 failed = 0
-LOAD_DATA = ww.load_data      # the real one: several tests replace it with a stub
+LOAD_DATA = ww.load_data      # the real ones: several tests replace them with stubs
+SAMPLE = ww.sample
+SMI = ww._smi
 
 
 def check(cond, msg):
@@ -65,8 +67,8 @@ class FakeSmi:
         class R:
             returncode, stdout, stderr = 0, "", ""
         r = R()
-        if argv[0] != "nvidia-smi":
-            return r
+        if argv[0] != "nvidia-smi" or "-i" not in argv:
+            return r          # a query, not a lock: nothing to record
         idx = int(argv[argv.index("-i") + 1])
         unlock = "-rgc" in argv
         mhz = None if unlock else int(argv[argv.index("-lgc") + 1])
@@ -471,6 +473,149 @@ with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
     rc = ww.cmd_install(type("A", (), {"profile": "eco", "data": None, "show": False})())
 check(rc == 1, f"a systemctl failure must give a non-zero exit code, got {rc}")
 check("systemd did not accept" in err.getvalue(), "and must say what went wrong")
+
+# ════════════ 8. second-round findings: silence, lies and NaN ═══════════════
+
+def test_missing_telemetry_is_an_error_not_a_cool_gpu():
+    """When nvidia-smi fails, sample() used to return [] - and an empty list is
+    never "too hot", so the temperature limit switched itself off in silence."""
+    ww.sample = SAMPLE                                   # the real reader, not a stub
+    ww._smi = lambda *a: "0, 2000, 200, 60, 50"          # GPU1 simply absent
+    try:
+        ww.sample([0, 1])
+        check(False, "a GPU that does not answer must raise, not be assumed cool")
+    except RuntimeError as e:
+        check("no telemetry" in str(e), f"the reason must be explicit: {e}")
+    ww._smi = lambda *a: "0, 2000, 200, 60, 50\n1, 2000, 210, 61, 55"
+    check(len(ww.sample([0, 1])) == 2, "a complete answer must still work")
+    ww._smi = SMI
+
+
+def test_a_failed_rollback_is_never_silent():
+    """Saying 'clocks were put back' when the rollback also failed is a lie told
+    exactly where the user most needs the truth."""
+    with_smi(FakeSmi(fail_on=[1], fail_unlock_on=[0]))
+    try:
+        ww.clock_lock([0, 1], 2100)
+        check(False, "the failure must raise")
+    except RuntimeError as e:
+        check("rollback failed" in str(e), f"the rollback failure must be reported: {e}")
+        check("nvidia-smi -rgc" in str(e), "and the user must be told how to fix it")
+
+
+def test_start_clears_a_stale_error():
+    """A transient failure caught right before stop() used to survive into the
+    next point and discard a perfectly good measurement.
+
+    The first version of this test let the restarted thread answer once before
+    looking, so the thread cleared the error by itself and the test passed even
+    with the fix removed. Here the first request is HELD until after the check:
+    if start() does not clear the error, nothing else can.
+    """
+    holding = threading.Event()
+    L = ww.Load("http://x", "m")
+
+    def held(prompt, tokens):
+        holding.wait(5)                  # the thread cannot heal on its own yet
+        return {"_started": time.time(), "_elapsed": 0.05,
+                "usage": {"completion_tokens": 10}}
+
+    L.request = held
+    L._error = "URLError: an outage that is already over"
+    L.start()
+    try:
+        L.check()        # must not raise: only start() can have cleared it
+    except RuntimeError as e:
+        check(False, f"a restarted load thread inherited a stale error: {e}")
+    finally:
+        holding.set()
+        L.stop()
+
+
+def test_nan_and_infinity_do_not_get_through():
+    check(not ww._real(float("nan")), "NaN is not a usable number")
+    check(not ww._real(float("inf")), "infinity is not a usable number")
+    check(not ww._real(True), "a boolean is not a measurement")
+    check(ww._real(0.5) and ww._real(3), "real numbers must pass")
+    hostile = {"points": [{"clock": None, "tps": float("nan"), "watt_total": 500},
+                          {"clock": float("inf"), "tps": 100, "watt_total": 400},
+                          {"clock": 2000, "tps": 90, "watt_total": 300}]}
+    kept = ww.usable_points(hostile)
+    check(len(kept) == 1 and kept[0]["clock"] == 2000,
+          f"only the sane point may survive, got {kept}")
+    ww.load_data = lambda _: hostile
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ww.cmd_profiles(type("A", (), {"data": None})())
+    except Exception as e:                                        # noqa: BLE001
+        check(False, f"NaN/Infinity crashed the table: {type(e).__name__}: {e}")
+
+
+def test_points_and_gpu_that_are_not_lists():
+    for bad in ({"points": 1}, {"points": True}, {"points": {"a": 1}}):
+        try:
+            check(ww.usable_points(bad) == [], f"{bad} must yield no points")
+        except Exception as e:                                    # noqa: BLE001
+            check(False, f"{bad} crashed usable_points: {type(e).__name__}: {e}")
+    ww.load_data = lambda _: {"points": [pt(None, 100, 500)], "gpu": 1}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ww.cmd_profiles(type("A", (), {"data": None})())
+    except Exception as e:                                        # noqa: BLE001
+        check(False, f"a non-list `gpu` crashed the table: {type(e).__name__}: {e}")
+
+
+def test_fastest_free_run_wins():
+    two = {"points": [pt(None, 50, 500), pt(None, 100, 500), pt(2000, 99, 300)]}
+    check(ww.derive(two)["power"]["tps"] == 100,
+          "with several unlocked runs the baseline must be the fastest, not the first")
+
+
+def test_two_points_at_one_clock_stay_two_rows():
+    """Grouping by clock alone printed one row using the other point's numbers."""
+    same = {"points": [pt(None, 120, 600), pt(2000, 119, 500), pt(2000, 60, 100)]}
+    ww.load_data = lambda _: same
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        ww.cmd_profiles(type("A", (), {"data": None})())
+    rows = [r for r in out.getvalue().splitlines() if r.strip().startswith(("free", "quiet", "eco"))]
+    check(len(rows) == 2, f"two different points at 2000 MHz must stay two rows:\n{rows}")
+
+
+def test_point_without_tokens_is_dropped_not_recorded():
+    """A point where no request fitted in the window has no tokens/s: recording
+    it makes the sweep look like it measured something it did not."""
+    ww.sample = lambda idx: [{"i": 0, "temp": 60, "watt": 200.0, "clock": 2000, "fan": 40}]
+    ww.gpu_indexes = lambda: [0]          # one GPU, and the stub above answers for it
+    ww.watch = lambda idx, seconds, load=None: None       # no 60 s of warmup in a test
+    with_smi(FakeSmi())
+
+    class NoSamples(DummyLoad):
+        def mean_between(self, a, b):
+            return None, 0
+
+    written: list = []
+    ww.write_data = lambda path, model, points: written.append(list(points))
+    ww.measure_prefill = lambda load, prompt: None
+    ww.Load = lambda *a, **k: NoSamples()
+    args = type("A", (), {"window": 4, "settle": 0, "tokens": 400, "clock": [2000],
+                          "endpoint": "http://x", "model": "m", "out": "/dev/null"})()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = ww.cmd_measure(args)
+    check(rc == 1 and not written,
+          f"a point with no tokens/s must not be written (rc={rc}, written={written})")
+    check("no request finished inside the sampling window" in err.getvalue(),
+          "and the user must be told why")
+
+
+for t in (test_missing_telemetry_is_an_error_not_a_cool_gpu,
+          test_a_failed_rollback_is_never_silent, test_start_clears_a_stale_error,
+          test_nan_and_infinity_do_not_get_through, test_points_and_gpu_that_are_not_lists,
+          test_fastest_free_run_wins, test_two_points_at_one_clock_stay_two_rows,
+          test_point_without_tokens_is_dropped_not_recorded):
+    t()
+
 
 print("FAILED:", failed) if failed else print("all ok")
 sys.exit(1 if failed else 0)

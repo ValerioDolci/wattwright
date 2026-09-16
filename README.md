@@ -100,8 +100,14 @@ Two more guarantees worth knowing about:
   change and the sampling window alike, not just the sampling. A card reaching **84 °C** ends that
   point and frees the clocks before moving on. The settle is exactly when a thermal overshoot is
   most likely, so watching only the sampling window was watching the wrong minute.
+- **Telemetry that does not answer is an error, not a cool GPU.** If `nvidia-smi` fails, the reading
+  is empty — and an empty reading is never "too hot", so the temperature limit would switch itself
+  off precisely when the instrument broke. A GPU that stops answering now stops the run.
 - **Measurements are written after every point.** A sweep is hours; a failure on the last point
   used to throw away all the earlier ones.
+- **A point with no tokens/s is dropped, not recorded.** If no request fits inside the sampling
+  window, there is nothing to report: writing the point anyway would make the sweep look like it
+  measured something it did not.
 
 ## Commands
 
@@ -156,17 +162,26 @@ Changing clocks needs root. Reading measurements does not.
 
 ## How this is tested
 
-`python3 tests/test_wattwright.py` — no GPU, no `nvidia-smi`, no endpoint required.
+```
+python3 tests/test_wattwright.py    # the suite: no GPU, no nvidia-smi, no endpoint
+python3 tests/mutate.py             # break each guarantee and check the suite notices
+```
 
-The suite is checked by **mutation**: every guarantee above has a deliberate break that must turn
-the suite red. Deleting the temperature check, emptying the restore, dropping the rollback,
-removing the `join` that stops the load thread, turning a missing reading back into a zero, or
-comparing the percentage rule naively — each of those is verified to fail the tests.
+`mutate.py` introduces **19 deliberate defects**, one at a time, and reports three outcomes:
+`caught` (the guarantee is guarded), `NOT CAUGHT` (the tests do not cover it) and `STALE` (the
+patch no longer matches the source, so nothing was mutated at all). The third one matters as much
+as the second: a mutation whose target text has drifted applies nothing, the suite passes for the
+wrong reason, and a dead check starts looking like a live one. Current state: **19 caught, 0 not
+caught, 0 stale.**
 
-This matters because the first version of this suite tested only the profile arithmetic, and an
-adversarial review showed that removing the temperature limit *and* the clock restore left it
-entirely green. Tests that cover the safe, pure part of a program and skip the part that can brick
-someone's afternoon are worse than no tests: they are a reason not to look.
+Passing all of them means those specific regressions are guarded. It does not mean the code has no
+bugs, and the difference is worth keeping in mind.
+
+Two rounds of adversarial review produced this. The first found bugs in the code. The second found
+bugs in the *tests*: one that passed with the fix removed because it let the code heal itself
+before looking, and a mutation that silently stopped applying. Those are the worse kind — a bug in
+the code bites you eventually, while a check that only looks like one persuades you there is
+nothing to see.
 
 ## Licence
 
