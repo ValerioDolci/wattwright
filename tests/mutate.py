@@ -102,6 +102,13 @@ MUTATIONS: list[tuple[str, str, str]] = [
 
     ("a point with no tokens/s is recorded anyway",
      '                if point["tps"] is None:', "                if False:"),
+
+    # --- found only by running the tool on a real GPU ----------------------
+    ("the same prompt is reused, so the cache answers the measurement",
+     '        load.request(f"{time.time_ns()} {prompt}", 1)          # warm the model\n'
+     '        value = Load.prefill_tps(load.request(f"{time.time_ns()} {prompt}", 1))',
+     "        load.request(prompt, 1)\n"
+     "        value = Load.prefill_tps(load.request(prompt, 1))"),
 ]
 
 

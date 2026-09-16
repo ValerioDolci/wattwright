@@ -31,6 +31,7 @@ failed = 0
 LOAD_DATA = ww.load_data      # the real ones: several tests replace them with stubs
 SAMPLE = ww.sample
 SMI = ww._smi
+MEASURE_PREFILL = ww.measure_prefill
 
 
 def check(cond, msg):
@@ -616,6 +617,32 @@ for t in (test_missing_telemetry_is_an_error_not_a_cool_gpu,
           test_point_without_tokens_is_dropped_not_recorded):
     t()
 
+
+def test_prefill_never_reuses_the_same_prompt():
+    """Sending the same long prompt twice measures the server's prompt cache.
+
+    Found only by running the tool on a real machine: the reading column said
+    50 tok/s where an independent measurement said 2007, because the second
+    request was served from cache and reported a handful of processed tokens.
+    Unit tests with stubs cannot see this - a stub has no cache.
+    """
+    ww.measure_prefill = MEASURE_PREFILL      # the real one, not an earlier stub
+    seen: list[str] = []
+
+    class Recording(DummyLoad):
+        def request(self, prompt, tokens):
+            seen.append(prompt)
+            return {"_started": 0.0, "_elapsed": 1.0, "usage": {"prompt_tokens": 1000}}
+
+    value = ww.measure_prefill(Recording(), "the long filler prompt")
+    check(len(seen) == 2, f"warm-up plus measurement: {len(seen)} requests")
+    check(seen[0] != seen[1], "the two prompts must differ, or the cache answers the second")
+    check(all("the long filler prompt" in p for p in seen),
+          "both must still carry the prompt being measured")
+    check(value == 1000.0, f"the reading speed must still be computed: {value}")
+
+
+test_prefill_never_reuses_the_same_prompt()
 
 print("FAILED:", failed) if failed else print("all ok")
 sys.exit(1 if failed else 0)

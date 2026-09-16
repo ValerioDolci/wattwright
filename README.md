@@ -171,11 +171,17 @@ python3 tests/mutate.py             # break each guarantee and check the suite n
 `caught` (the guarantee is guarded), `NOT CAUGHT` (the tests do not cover it) and `STALE` (the
 patch no longer matches the source, so nothing was mutated at all). The third one matters as much
 as the second: a mutation whose target text has drifted applies nothing, the suite passes for the
-wrong reason, and a dead check starts looking like a live one. Current state: **19 caught, 0 not
+wrong reason, and a dead check starts looking like a live one. Current state: **20 caught, 0 not
 caught, 0 stale.**
 
 Passing all of them means those specific regressions are guarded. It does not mean the code has no
 bugs, and the difference is worth keeping in mind.
+
+It also found the one bug nothing else did. Two adversarial reviews and nineteen mutations all
+missed that the reading speed was measured on a prompt the server had just cached — the tool
+reported 50 tok/s where an independent measurement said 2007. No stub has a cache, so no unit test
+could see it; running the thing on a real GPU took five minutes and found it immediately. Unit
+tests show the parts behave as you believe. Only the hardware shows the program does its job.
 
 Two rounds of adversarial review produced this. The first found bugs in the code. The second found
 bugs in the *tests*: one that passed with the fix removed because it let the code heal itself
