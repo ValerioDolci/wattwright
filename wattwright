@@ -21,15 +21,15 @@ import threading
 import time
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DATA_FILE = os.environ.get("WATTWRIGHT_DATA", "wattwright.json")
-UNIT = "/etc/systemd/system/wattwright.service"
+UNIT_PATH = "/etc/systemd/system/wattwright.service"
 
 # Thresholds that define the profiles. These are declared rules, not taste:
 # they are applied to YOUR numbers and they are documented in the README.
 FREE_RATIO = 0.99        # the lowest clock that still keeps 99% of the tokens/s
 QUIET_RATIO = 0.95       # ... and 95%
-TEMP_ABORT = 84          # deg C: above this the point is dropped and clocks restored
+TEMP_ABORT = 84          # deg C: above this the clocks are freed and the point dropped
 
 
 # ------------------------------- telemetry -------------------------------
@@ -40,7 +40,20 @@ def _smi(*args: str) -> str:
 
 def gpu_indexes() -> list[int]:
     out = _smi("--query-gpu=index", "--format=csv,noheader")
-    return [int(r) for r in out.splitlines() if r.strip()]
+    return [int(r) for r in out.splitlines() if r.strip().isdigit()]
+
+
+def _num(x: str) -> float | None:
+    """`[N/A]` and friends become None, never 0.
+
+    A missing wattage read as 0 W does not look like an error: it looks like an
+    extremely efficient card, and it can hand you the wrong `eco` profile. Only
+    the caller knows whether a missing field is survivable.
+    """
+    try:
+        return float(x)
+    except ValueError:
+        return None
 
 
 def sample(indexes: list[int]) -> list[dict]:
@@ -49,46 +62,62 @@ def sample(indexes: list[int]) -> list[dict]:
     read = []
     for row in _smi(f"--query-gpu={fields}", "--format=csv,noheader,nounits").splitlines():
         p = [x.strip() for x in row.split(",")]
-        if len(p) < 5 or int(p[0]) not in indexes:
+        if len(p) < 5 or not p[0].isdigit() or int(p[0]) not in indexes:
             continue
-
-        def num(x: str) -> float:
-            try:
-                return float(x)
-            except ValueError:
-                return 0.0      # [N/A]: some cards expose no fan reading at all
-
-        read.append({"i": int(p[0]), "clock": num(p[1]), "watt": num(p[2]),
-                     "temp": num(p[3]), "fan": num(p[4])})
+        read.append({"i": int(p[0]), "clock": _num(p[1]), "watt": _num(p[2]),
+                     "temp": _num(p[3]), "fan": _num(p[4])})
     return read
 
 
-def gpu_busy() -> list[str]:
-    out = _smi("--query-compute-apps=pid,process_name", "--format=csv,noheader")
+def gpu_processes() -> list[str]:
+    out = _smi("--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader")
     return [r for r in out.splitlines() if r.strip()]
 
 
 # --------------------------------- levers ---------------------------------
 
+def _lock_one(index: int, mhz: int | None) -> str | None:
+    args = ["-i", str(index)] + (["-rgc"] if mhz is None else ["-lgc", str(int(mhz))])
+    r = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"GPU{index}: {(r.stderr or r.stdout).strip()}"
+    return None
+
+
 def clock_lock(indexes: list[int], mhz: int | None) -> None:
+    """Apply to every GPU, and if any of them fails, put back the ones already changed.
+
+    Stopping at the first failure is how you end up with half a machine locked at
+    a clock nobody chose - a state that outlives the process that created it.
+    """
+    done, errors = [], []
     for i in indexes:
-        args = ["-i", str(i)] + (["-rgc"] if mhz is None else ["-lgc", str(mhz)])
-        r = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"nvidia-smi {' '.join(args)}: "
-                               f"{r.stderr.strip() or r.stdout.strip()}")
+        err = _lock_one(i, mhz)
+        (errors if err else done).append(err or i)
+    if errors:
+        if mhz is not None:                       # roll the partial lock back
+            for i in done:
+                _lock_one(i, None)
+        raise RuntimeError("; ".join(errors))
+
+
+def unlock_all(indexes: list[int]) -> list[str]:
+    """Best effort: every GPU is attempted even when an earlier one fails."""
+    return [e for e in (_lock_one(i, None) for i in indexes) if e]
 
 
 class Restore:
     """Clocks go back to free whatever happens: exception, Ctrl-C or SIGTERM.
 
     This is not a detail. A clock lock left behind by a dead process stays on the
-    card until the next reboot, and nobody remembers why the machine got slow.
+    card until the next reboot and nobody remembers why the machine got slow.
+    A second signal arriving during the cleanup must not interrupt the cleanup.
     """
 
     def __init__(self, indexes: list[int]):
         self.indexes = indexes
         self._previous: dict = {}
+        self._cleaning = False
 
     def __enter__(self):
         for s in (signal.SIGTERM, signal.SIGINT):
@@ -96,16 +125,23 @@ class Restore:
         return self
 
     def _on_signal(self, *_):
+        if self._cleaning:
+            return                                # already restoring: let it finish
         raise KeyboardInterrupt
 
     def __exit__(self, *exc):
+        self._cleaning = True
         try:
-            clock_lock(self.indexes, None)
-            print("clocks restored to free", file=sys.stderr)
-        except Exception as e:                                   # noqa: BLE001
-            print(f"WARNING: restore failed: {e}", file=sys.stderr)
-        for s, h in self._previous.items():
-            signal.signal(s, h)
+            errors = unlock_all(self.indexes)
+            if errors:
+                print("WARNING: could not restore: " + "; ".join(errors), file=sys.stderr)
+                print("Run `nvidia-smi -rgc` as root to unlock them.", file=sys.stderr)
+            else:
+                print("clocks restored to free", file=sys.stderr)
+        finally:
+            for s, h in self._previous.items():
+                signal.signal(s, h)
+            self._cleaning = False
         return False
 
 
@@ -115,7 +151,7 @@ class Load:
     """Load generator against an OpenAI-compatible endpoint.
 
     Reads tokens/s from the `timings` field when the server provides one
-    (llama.cpp), otherwise times the request and uses the token count from
+    (llama.cpp), otherwise times the request and uses the token counts from
     `usage`. It runs in a thread, so telemetry is sampled WHILE the GPU is
     working rather than after it went idle.
     """
@@ -123,13 +159,13 @@ class Load:
     def __init__(self, endpoint: str, model: str, tokens: int = 400):
         self.url = endpoint.rstrip("/") + "/v1/completions"
         self.model, self.tokens = model, tokens
-        self.stop = threading.Event()
-        self.samples: list[tuple[float, float]] = []      # (finished_at, tokens/s)
+        self._stop = threading.Event()
+        self.samples: list[tuple[float, float, float]] = []   # (started, finished, tok/s)
         self._lock = threading.Lock()
         self._error: str | None = None
         self._thread: threading.Thread | None = None
 
-    def _one(self, prompt: str, tokens: int) -> tuple[float, float]:
+    def request(self, prompt: str, tokens: int) -> dict:
         body = json.dumps({"model": self.model, "prompt": prompt, "max_tokens": tokens,
                            "temperature": 0, "stream": False}).encode()
         req = urllib.request.Request(self.url, data=body,
@@ -137,48 +173,118 @@ class Load:
         t0 = time.time()
         with urllib.request.urlopen(req, timeout=600) as r:
             d = json.load(r)
-        dt = time.time() - t0
-        t = d.get("timings") or {}
-        if t.get("predicted_per_second"):
-            return t["predicted_per_second"], t.get("prompt_per_second", 0.0)
-        n = (d.get("usage") or {}).get("completion_tokens", tokens)
-        return (n / dt if dt else 0.0), 0.0
+        d["_started"], d["_elapsed"] = t0, time.time() - t0
+        return d
 
-    def prefill(self, prompt: str) -> float:
-        """Prompt-reading tokens/s, measured on its own: it is compute-bound and
-        it degrades differently from generation. Measuring only decode hides that."""
-        self._one(prompt, 8)                       # warm up, then keep the second
-        _, p = self._one(prompt, 8)
-        return p
+    @staticmethod
+    def decode_tps(d: dict, asked: int) -> float | None:
+        t = d.get("timings") or {}
+        if isinstance(t.get("predicted_per_second"), (int, float)):
+            return float(t["predicted_per_second"])
+        n = (d.get("usage") or {}).get("completion_tokens")
+        n = n if isinstance(n, (int, float)) else asked
+        return (n / d["_elapsed"]) if d.get("_elapsed") else None
+
+    @staticmethod
+    def prefill_tps(d: dict) -> float | None:
+        """Prompt-processing tokens/s.
+
+        llama.cpp hands it over; the other backends do not, so it is computed
+        from the prompt token count and the wall time. When neither is available
+        the answer is None - reported as unknown, never as zero. A zero in that
+        column would read as "this backend is infinitely slow at reading", which
+        is a lie the user has no way to spot.
+        """
+        t = d.get("timings") or {}
+        if isinstance(t.get("prompt_per_second"), (int, float)):
+            return float(t["prompt_per_second"])
+        n = (d.get("usage") or {}).get("prompt_tokens")
+        if isinstance(n, (int, float)) and n > 0 and d.get("_elapsed"):
+            return float(n) / d["_elapsed"]
+        return None
 
     def start(self) -> None:
+        """Start the load thread, refusing to leave a second one running."""
+        if self.running:
+            raise RuntimeError("a load thread is already running")
+
         def loop():
-            while not self.stop.is_set():
+            while not self._stop.is_set():
                 try:
-                    tps, _ = self._one("Once upon a time in a distant land", self.tokens)
+                    d = self.request("Once upon a time in a distant land", self.tokens)
+                    tps = self.decode_tps(d, self.tokens)
                     with self._lock:
-                        self.samples.append((time.time(), tps))
-                except Exception as e:                           # noqa: BLE001
-                    self._error = f"{type(e).__name__}: {e}"
+                        if tps:
+                            self.samples.append((d["_started"], time.time(), tps))
+                        self._error = None        # a good answer clears a past error
+                except Exception as e:                            # noqa: BLE001
+                    with self._lock:
+                        self._error = f"{type(e).__name__}: {e}"
                     time.sleep(2)
-        self.stop.clear()
-        self._thread = threading.Thread(target=loop, daemon=True)
+
+        self._stop.clear()
+        self._thread = threading.Thread(target=loop, name="wattwright-load", daemon=True)
         self._thread.start()
 
-    def stop_load(self) -> None:
-        self.stop.set()
+    def stop(self, timeout: float = 620) -> None:
+        """Stop AND wait for the in-flight request to finish.
 
-    def mean_since(self, moment: float) -> tuple[float | None, int]:
+        Without the join the old thread keeps generating into the next phase:
+        two concurrent loads, and a measurement of something that never happened.
+        """
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout)
+            if t.is_alive():
+                raise RuntimeError("the load thread will not stop: is the endpoint hung?")
+            self._thread = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def mean_between(self, start: float, end: float) -> tuple[float | None, int]:
+        """Only requests that started AND finished inside the window count.
+
+        A request straddling a clock change spans two operating points; averaging
+        it into either one quietly mixes them.
+        """
         with self._lock:
-            v = [t for ts, t in self.samples if ts >= moment]
+            v = [t for s, f, t in self.samples if s >= start and f <= end]
         return (statistics.fmean(v) if v else None), len(v)
 
     def check(self) -> None:
-        if self._error:
-            raise RuntimeError(f"the endpoint is not answering - {self._error}")
+        with self._lock:
+            err = self._error
+        if err:
+            raise RuntimeError(f"the endpoint is not answering - {err}")
 
 
 # -------------------------------- measure --------------------------------
+
+def too_hot(reading: list[dict]) -> int | None:
+    for g in reading:
+        if g["temp"] is not None and g["temp"] >= TEMP_ABORT:
+            return g["i"]
+    return None
+
+
+def watch(indexes: list[int], seconds: float, load: Load | None = None) -> None:
+    """Wait, but keep watching the temperature while waiting.
+
+    Checking only during the sampling window left the settle right after a clock
+    change - the likeliest moment for a thermal overshoot - completely unwatched.
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        hot = too_hot(sample(indexes))
+        if hot is not None:
+            raise RuntimeError(f"ABORT: GPU{hot} reached {TEMP_ABORT} C")
+        if load is not None:
+            load.check()
+        time.sleep(max(0.05, min(2.0, deadline - time.time())))
+
 
 def measure_point(indexes: list[int], load: Load, mhz: int | None,
                   settle: int, window: int) -> dict:
@@ -187,30 +293,38 @@ def measure_point(indexes: list[int], load: Load, mhz: int | None,
     The wait is not politeness. A GPU read during the ramp gives numbers that do
     not exist - temperatures and fans in transit - and fans coming DOWN stay high
     out of inertia, so a descending sweep reports fan values that are an upper
-    bound rather than the equilibrium. Every point here starts settled.
+    bound rather than an equilibrium. Every point here starts settled.
     """
     clock_lock(indexes, mhz)
-    time.sleep(settle)
+    watch(indexes, settle, load)
     t0 = time.time()
     reads: list[list[dict]] = []
     while time.time() - t0 < window:
         s = sample(indexes)
-        for g in s:
-            if g["temp"] >= TEMP_ABORT:
-                raise RuntimeError(f"ABORT: GPU{g['i']} at {g['temp']:.0f} C "
-                                   f"(limit {TEMP_ABORT})")
+        hot = too_hot(s)
+        if hot is not None:
+            raise RuntimeError(f"ABORT: GPU{hot} reached {TEMP_ABORT} C")
         reads.append(s)
         load.check()
         time.sleep(2)
-    tps, n = load.mean_since(t0)
+    tps, n = load.mean_between(t0, time.time())
 
-    def agg(key: str, f=statistics.fmean) -> float:
-        return round(f([g[key] for s in reads for g in s]), 1)
+    def agg(key: str, f=statistics.fmean) -> float | None:
+        v = [g[key] for s in reads for g in s if g[key] is not None]
+        return round(f(v), 1) if v else None
 
     # Watts are SUMMED across cards (it is what the machine draws); everything
     # else is averaged. The mean of two cards' wattage means nothing.
-    per_gpu = {i: statistics.fmean([g["watt"] for s in reads for g in s if g["i"] == i])
-               for i in indexes}
+    per_gpu: dict[int, float] = {}
+    for i in indexes:
+        w = [g["watt"] for s in reads for g in s if g["i"] == i and g["watt"] is not None]
+        if w:
+            per_gpu[i] = statistics.fmean(w)
+    missing = sorted(set(indexes) - set(per_gpu))
+    if missing:
+        raise RuntimeError(f"no power reading from GPU {missing}: this point would be "
+                           f"wrong in a way that looks right")
+
     return {"clock": mhz, "tps": round(tps, 2) if tps else None, "load_samples": n,
             "watt_total": round(sum(per_gpu.values()), 1),
             "watt_per_gpu": {str(i): round(w, 1) for i, w in per_gpu.items()},
@@ -219,96 +333,179 @@ def measure_point(indexes: list[int], load: Load, mhz: int | None,
             "clock_real": agg("clock")}
 
 
+def write_data(path: str, model: str, points: list[dict]) -> None:
+    """Called after EVERY point. A sweep takes hours, and a failure on the last
+    one used to throw away all of them."""
+    with open(path, "w") as f:
+        json.dump({"wattwright": VERSION, "when": time.strftime("%Y-%m-%d %H:%M"),
+                   "gpu": _smi("--query-gpu=name", "--format=csv,noheader").splitlines(),
+                   "model": model, "points": points}, f, indent=2)
+
+
 def cmd_measure(a) -> int:
-    busy = gpu_busy()
-    if busy:
-        print("GPU already in use by: " + "; ".join(busy), file=sys.stderr)
-        print("A measurement taken next to another GPU process is worthless. "
-              "Stop it, or pass --force.", file=sys.stderr)
-        if not a.force:
+    for name, value, low in (("--window", a.window, 4), ("--settle", a.settle, 0),
+                             ("--tokens", a.tokens, 1)):
+        if value < low:
+            print(f"{name} must be >= {low}", file=sys.stderr)
             return 2
     indexes = gpu_indexes()
     if not indexes:
         print("no NVIDIA GPU found", file=sys.stderr)
         return 2
 
+    # The inference server is itself a process on the GPU, so its presence is
+    # expected and must not block the run. Showing the list is still worth it:
+    # a second workload would quietly poison every number below.
+    busy = gpu_processes()
+    if busy:
+        print("processes on the GPU (your inference server should be one of them):",
+              file=sys.stderr)
+        for b in busy:
+            print("  " + b, file=sys.stderr)
+        print("anything else running will distort the measurement.", file=sys.stderr)
+
     load = Load(a.endpoint, a.model, a.tokens)
     long_prompt = "This sentence is here to fill the context so reading can be measured. " * 400
-    results: list[dict] = []
+    points: list[dict] = []
     print(f"wattwright {VERSION} - {len(indexes)} GPU(s) - endpoint {a.endpoint} "
           f"- model {a.model}", file=sys.stderr)
 
     with Restore(indexes):
-        load.start()
-        print("warming up for 60 s before the first point...", file=sys.stderr)
-        time.sleep(60)
-        for mhz in [None] + list(a.clock):
-            label = "free" if mhz is None else f"{mhz} MHz"
-            print(f"  point {label} (settling {a.settle} s)...", file=sys.stderr, flush=True)
-            try:
-                r = measure_point(indexes, load, mhz, a.settle, a.window)
-            except RuntimeError as e:
-                print(f"  ! {e} - point dropped", file=sys.stderr)
-                continue
-            load.stop_load()
-            time.sleep(2)
-            r["prefill_tps"] = round(load.prefill(long_prompt), 1)
+        try:
             load.start()
-            results.append(r)
-            print(f"    {r['tps']} tok/s - {r['prefill_tps']} tok/s reading - "
-                  f"{r['watt_total']} W - {r['temp_mean']} C - fan {r['fan_mean']}%",
-                  file=sys.stderr)
-        load.stop_load()
+            print("warming up for 60 s before the first point...", file=sys.stderr)
+            watch(indexes, 60, load)
+            for mhz in [None] + list(a.clock):
+                label = "free" if mhz is None else f"{mhz} MHz"
+                print(f"  point {label} (settling {a.settle} s)...", file=sys.stderr, flush=True)
+                try:
+                    point = measure_point(indexes, load, mhz, a.settle, a.window)
+                except RuntimeError as e:
+                    print(f"  ! {e} - point dropped", file=sys.stderr)
+                    unlock_all(indexes)        # never carry a lock into the next point
+                    if not load.running:
+                        load.start()
+                    continue
+                point["prefill_tps"] = measure_prefill(load, long_prompt)
+                points.append(point)
+                write_data(a.out, a.model, points)     # durable after every point
+                reading = ("n/a" if point["prefill_tps"] is None
+                           else f"{point['prefill_tps']}")
+                print(f"    {point['tps']} tok/s - {reading} tok/s reading - "
+                      f"{point['watt_total']} W - {point['temp_mean']} C - "
+                      f"fan {point['fan_mean']}", file=sys.stderr)
+        finally:
+            try:
+                load.stop()
+            except RuntimeError as e:
+                print(f"WARNING: {e}", file=sys.stderr)
 
-    data = {"wattwright": VERSION, "when": time.strftime("%Y-%m-%d %H:%M"),
-            "gpu": _smi("--query-gpu=name", "--format=csv,noheader").splitlines(),
-            "model": a.model, "points": results}
-    with open(a.out, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"\nwrote {a.out} - now run: wattwright profiles", file=sys.stderr)
+    if not points:
+        print("\nno usable point: nothing written.", file=sys.stderr)
+        return 1
+    print(f"\nwrote {a.out} ({len(points)} points) - now run: wattwright profiles",
+          file=sys.stderr)
     return 0
+
+
+def measure_prefill(load: Load, prompt: str) -> float | None:
+    """Reading speed, measured with the background load stopped.
+
+    Any failure here costs the reading column of one point, never the sweep:
+    the clock and power numbers have already been measured and are worth keeping.
+    """
+    try:
+        load.stop()
+        load.request(prompt, 8)                    # warm, then keep the second
+        value = Load.prefill_tps(load.request(prompt, 8))
+        return round(value, 1) if value is not None else None
+    except Exception as e:                                       # noqa: BLE001
+        print(f"    (reading speed not measured: {type(e).__name__}: {e})", file=sys.stderr)
+        return None
+    finally:
+        if not load.running:
+            try:
+                load.start()
+            except RuntimeError:
+                pass
 
 
 # -------------------------------- profiles --------------------------------
 
+def usable_points(data: dict) -> list[dict]:
+    """Only the points we can actually reason about, whatever the file contains.
+
+    Measurement files are meant to be shared and hand-edited, so everything here
+    is treated as untrusted input rather than as something we wrote ourselves.
+    """
+    raw = data.get("points") if isinstance(data, dict) else None
+    good = []
+    for p in raw or []:
+        if not isinstance(p, dict):
+            continue
+        if not isinstance(p.get("tps"), (int, float)) or isinstance(p.get("tps"), bool):
+            continue
+        if not isinstance(p.get("watt_total"), (int, float)) or isinstance(p.get("watt_total"), bool):
+            continue
+        if p["tps"] <= 0 or p["watt_total"] <= 0:
+            continue
+        clock = p.get("clock")
+        if clock is not None and (isinstance(clock, bool) or not isinstance(clock, (int, float))):
+            continue
+        good.append(p)
+    return good
+
+
 def derive(data: dict) -> dict[str, dict]:
     """Turn YOUR numbers into profiles, with rules that are stated up front.
 
-    power = no lock
+    power = no lock at all
     free  = the lowest clock that still keeps 99% of the tokens/s
     quiet = the lowest clock that still keeps 95%
-    eco   = the highest tokens per watt
+    eco   = the highest tokens per watt, across every point including the free run
 
     Two rules can land on the same clock. That is information, not a problem:
-    every name stays usable on the command line and the table groups them on a
-    single row, so you can see that one point is both the quietest acceptable
-    one and the most efficient, instead of one of them being hidden.
+    every name stays usable on the command line and the table groups them on one
+    row. `power` exists only when the file really contains an unlocked run,
+    otherwise the name would promise a state nobody measured.
     """
-    points = [p for p in data.get("points", []) if p.get("tps")]
+    points = usable_points(data)
     if not points:
         return {}
-    free_run = next((p for p in points if p["clock"] is None),
-                    max(points, key=lambda p: p["tps"]))
-    locked = sorted((p for p in points if p["clock"]), key=lambda p: p["clock"])
-    prof: dict[str, dict] = {"power": free_run}
+    unlocked = next((p for p in points if p.get("clock") is None), None)
+    reference = unlocked or max(points, key=lambda p: p["tps"])
+    locked = sorted((p for p in points if p.get("clock") is not None),
+                    key=lambda p: p["clock"])
+    prof: dict[str, dict] = {}
+    if unlocked is not None:
+        prof["power"] = unlocked
     for name, ratio in (("free", FREE_RATIO), ("quiet", QUIET_RATIO)):
         # Compare on the SAME rounded percentage the table prints. Otherwise a
-        # point shown as "95%" can be rejected by a 95% rule for a thousandth
-        # (measured: 117.17 / 123.34 = 94.997%), and the tool contradicts itself.
+        # point shown as "95%" gets rejected by a 95% rule over a thousandth
+        # (measured: 117.17 / 123.34 = 94.997%) and the tool contradicts itself.
         ok = [p for p in locked
-              if round(p["tps"] / free_run["tps"] * 100) >= round(ratio * 100)]
+              if round(p["tps"] / reference["tps"] * 100) >= round(ratio * 100)]
         if ok:
             prof[name] = min(ok, key=lambda p: p["clock"])
-    if locked:
-        prof["eco"] = max(locked, key=lambda p: p["tps"] / max(p["watt_total"], 1e-9))
+    prof["eco"] = max(points, key=lambda p: p["tps"] / p["watt_total"])
     return prof
 
 
 def load_data(path: str) -> dict:
     if not os.path.exists(path):
         raise SystemExit(f"{path} not found: run `wattwright measure` first")
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{path} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} does not look like a wattwright measurement file")
+    return data
+
+
+def _fmt(value, spec: str, fallback: str = "n/a") -> str:
+    return format(value, spec) if isinstance(value, (int, float)) else fallback
 
 
 def cmd_profiles(a) -> int:
@@ -317,26 +514,37 @@ def cmd_profiles(a) -> int:
     if not prof:
         print("no usable point in the measurements", file=sys.stderr)
         return 1
-    ref = prof["power"]
-    print(f"measured {data.get('when')} - {', '.join(data.get('gpu', []))} "
-          f"- model {data.get('model')}\n")
+    reference = prof.get("power") or max(prof.values(), key=lambda p: p["tps"])
+    gpus = [g for g in (data.get("gpu") or []) if isinstance(g, str)]
+    print(f"measured {data.get('when', '?')} - {', '.join(gpus) or 'unknown GPU'} "
+          f"- model {data.get('model', '?')}\n")
+    if "power" not in prof:
+        print("note: this file has no unlocked run, so percentages are relative to the\n"
+              "      fastest measured point and there is no `power` profile.\n")
     groups: dict[object, list[str]] = {}
-    for name, p in prof.items():          # one row per clock, all names that land on it
-        groups.setdefault(p["clock"], []).append(name)
+    for name, p in prof.items():        # one row per clock, every name that lands on it
+        groups.setdefault(p.get("clock"), []).append(name)
     print(f"{'profile':22} {'clock':>8} {'tok/s':>14} {'reading':>9} "
           f"{'watts':>13} {'C':>5} {'fan':>6}")
     for clock_value, names in groups.items():
         p = prof[names[0]]
-        name = " / ".join(names)
-        clock = "free" if clock_value is None else str(clock_value)
-        share = f"{p['tps'] / ref['tps'] * 100:.0f}%"
-        watts = f"{p['watt_total'] / ref['watt_total'] * 100:.0f}%"
-        print(f"{name:22} {clock:>8} {p['tps']:>8.1f} {share:>5} "
-              f"{p.get('prefill_tps', 0):>8.0f} {p['watt_total']:>8.0f} {watts:>5} "
-              f"{p['temp_mean']:>4.0f} {p['fan_mean']:>5.0f}%")
+        share = f"{p['tps'] / reference['tps'] * 100:.0f}%"
+        watts = f"{p['watt_total'] / reference['watt_total'] * 100:.0f}%"
+        print(f"{' / '.join(names):22} "
+              f"{'free' if clock_value is None else int(clock_value):>8} "
+              f"{p['tps']:>8.1f} {share:>5} {_fmt(p.get('prefill_tps'), '>8.0f'):>8} "
+              f"{p['watt_total']:>8.0f} {watts:>5} "
+              f"{_fmt(p.get('temp_mean'), '>4.0f', '-'):>4} "
+              f"{_fmt(p.get('fan_mean'), '.0f', '-') + ('%' if isinstance(p.get('fan_mean'), (int, float)) else ''):>5}")
     print(f"\nrules: free = slowest clock keeping {FREE_RATIO:.0%} of tokens/s"
           f" - quiet = {QUIET_RATIO:.0%} - eco = highest tokens per watt")
     return 0
+
+
+def needs_data(name: str) -> bool:
+    """`power` and a raw MHz value mean the same thing on every machine, so they
+    have to work without a measurement file."""
+    return not (name in ("power", "free-clock", "none") or name.isdigit())
 
 
 def resolve(data: dict, name: str) -> int | None:
@@ -346,24 +554,41 @@ def resolve(data: dict, name: str) -> int | None:
         return int(name)
     prof = derive(data)
     if name not in prof:
-        raise SystemExit(f"unknown profile: {name} (I have {', '.join(prof)})")
-    return prof[name]["clock"]
+        known = ", ".join(prof) or "none (this file has no usable point)"
+        raise SystemExit(f"unknown profile: {name} (available: {known})")
+    clock = prof[name].get("clock")
+    return None if clock is None else int(clock)
 
 
 def cmd_set(a) -> int:
-    data = {} if a.profile.isdigit() else load_data(a.data)
+    data = load_data(a.data) if needs_data(a.profile) else {}
     mhz = resolve(data, a.profile)
-    clock_lock(gpu_indexes(), mhz)
-    print(f"profile {a.profile}: clock {'free' if mhz is None else str(mhz) + ' MHz'}")
+    indexes = gpu_indexes()
+    if not indexes:
+        print("no NVIDIA GPU found", file=sys.stderr)
+        return 2
+    try:
+        clock_lock(indexes, mhz)            # rolls itself back on a partial failure
+    except RuntimeError as e:
+        print(f"could not apply the profile: {e}", file=sys.stderr)
+        print("clocks were put back the way they were.", file=sys.stderr)
+        return 1
+    print(f"profile {a.profile}: clock {'free' if mhz is None else str(mhz) + ' MHz'} "
+          f"on GPU {', '.join(map(str, indexes))}")
     return 0
 
 
 def cmd_status(a) -> int:
-    for g in sample(gpu_indexes()):
-        print(f"GPU{g['i']}  {g['clock']:>5.0f} MHz  {g['watt']:>6.1f} W  "
-              f"{g['temp']:>3.0f} C  fan {g['fan']:>3.0f}%")
-    if os.path.exists(UNIT):
-        print(f"\nboot profile installed: {UNIT}")
+    reading = sample(gpu_indexes())
+    if not reading:
+        print("no NVIDIA GPU found", file=sys.stderr)
+        return 2
+    for g in reading:
+        print(f"GPU{g['i']} {_fmt(g['clock'], '>5.0f'):>5} MHz "
+              f"{_fmt(g['watt'], '>6.1f'):>6} W {_fmt(g['temp'], '>3.0f'):>3} C "
+              f"fan {_fmt(g['fan'], '>3.0f'):>3}%")
+    if os.path.exists(UNIT_PATH):
+        print(f"\nboot profile installed: {UNIT_PATH}")
     return 0
 
 
@@ -387,13 +612,44 @@ WantedBy=multi-user.target
 """
 
 
+def systemctl(*args: str) -> bool:
+    r = subprocess.run(["systemctl", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"systemctl {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def cmd_install(a) -> int:
-    mhz = resolve(load_data(a.data), a.profile)
+    data = load_data(a.data) if needs_data(a.profile) else {}
+    mhz = resolve(data, a.profile)
     if mhz is None:
-        print('"power" is already the default behaviour: no unit needed.')
+        # "power" is the ABSENCE of a lock, so installing it means removing any
+        # unit already in place - otherwise the old profile silently comes back
+        # at the next reboot and the command appears to have done nothing.
+        if not os.path.exists(UNIT_PATH):
+            print('"power" is the default behaviour: nothing to install.')
+            return 0
+        if a.show:
+            print(f"would remove {UNIT_PATH}")
+            return 0
+        systemctl("disable", "--now", "wattwright")
+        try:
+            os.remove(UNIT_PATH)
+        except OSError as e:
+            print(f"could not remove {UNIT_PATH}: {e}", file=sys.stderr)
+            return 2
+        systemctl("daemon-reload")
+        print("boot profile removed: the machine will start with free clocks.")
         return 0
-    smi = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
+
     indexes = gpu_indexes()
+    if not indexes:
+        print("no NVIDIA GPU found: refusing to write a unit with nothing to do",
+              file=sys.stderr)
+        return 2
+    smi = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
     text = UNIT_TEMPLATE.format(
         name=a.profile, clock=f"{mhz} MHz",
         start="\n".join(f"ExecStart={smi} -i {i} -lgc {mhz}" for i in indexes),
@@ -402,15 +658,16 @@ def cmd_install(a) -> int:
         print(text)
         return 0
     try:
-        with open(UNIT, "w") as f:
+        with open(UNIT_PATH, "w") as f:
             f.write(text)
     except PermissionError:
-        print(f"root privileges are needed to write {UNIT}", file=sys.stderr)
+        print(f"root privileges are needed to write {UNIT_PATH}", file=sys.stderr)
         return 2
-    subprocess.run(["systemctl", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "enable", "--now", "wattwright"], check=False)
+    if not systemctl("daemon-reload") or not systemctl("enable", "--now", "wattwright"):
+        print("the unit file was written but systemd did not accept it.", file=sys.stderr)
+        return 1
     print(f'profile "{a.profile}" ({mhz} MHz) is now applied at every boot.')
-    print(f"to remove it: systemctl disable --now wattwright && rm {UNIT}")
+    print("to remove it: wattwright install power")
     return 0
 
 
@@ -435,7 +692,6 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--window", type=int, default=30, help="seconds of sampling per point")
     m.add_argument("--tokens", type=int, default=400, help="tokens generated per request")
     m.add_argument("--out", default=DATA_FILE)
-    m.add_argument("--force", action="store_true", help="measure even if the GPU is busy")
     m.set_defaults(func=cmd_measure)
 
     f = sub.add_parser("profiles", help="show the profiles derived from the measurements")
@@ -460,8 +716,8 @@ def main(argv: list[str] | None = None) -> int:
     # Only the commands that actually touch the GPU need the driver: reading a
     # measurement file must work anywhere, so curves can be shared and compared.
     if a.cmd in ("measure", "set", "status", "install") and not shutil.which("nvidia-smi"):
-        print("nvidia-smi not found: the NVIDIA driver is required for "
-              f"`{a.cmd}` (`profiles` works without it).", file=sys.stderr)
+        print(f"nvidia-smi not found: the NVIDIA driver is required for `{a.cmd}` "
+              f"(`profiles` works without it).", file=sys.stderr)
         return 2
     try:
         return a.func(a)

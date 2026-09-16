@@ -26,10 +26,12 @@ Real output from a 2× RTX 5070 Ti box running Qwen3.8-27B on llama.cpp, tensor-
 
 ```
 profile                   clock          tok/s   reading         watts     C    fan
-power                      free    123.3  100%     2007      505  100%   74    67%
-free                       2700    123.3  100%     1973      465   92%   72    63%
-quiet                      2400    117.2   95%     1838      367   73%   68    52%
-eco                        2100    105.1   85%     1655      303   60%   66    44%
+power                      free    123.3  100%     2007      505  100%   74   67%
+free                       2700    123.3  100%     1973      465   92%   72   63%
+quiet                      2400    117.2   95%     1838      367   73%   68   52%
+eco                        2100    105.1   85%     1655      303   60%   66   44%
+
+rules: free = slowest clock keeping 99% of tokens/s - quiet = 95% - eco = highest tokens per watt
 ```
 
 Read that table and the decision makes itself: on this machine **2700 MHz is free** — 8% fewer
@@ -78,7 +80,7 @@ They all cost real measurements before the rules above existed.
 
 1. **Fans have inertia coming down.** Sweeping from high clock to low leaves fans spinning fast
    from the previous, hotter point: the fan column of a descending sweep is an *upper bound*, not
-   an equilibrium. The same machine reported 78% at 2400 MHz during a descending sweep and **63%**
+   an equilibrium. The same machine reported a 78% duty at 2400 MHz during a descending sweep and **63%**
    when the point was measured from settled. wattwright settles every point before sampling; if
    you write your own sweep, do the same.
 2. **Cold versus warm invalidates everything.** Benchmarking an image job at free clock first and
@@ -87,10 +89,19 @@ They all cost real measurements before the rules above existed.
    the load, not the clock.
 3. **A lock left behind outlives the process.** `nvidia-smi -lgc` is not scoped to your program:
    if the process dies, the lock stays on the card until reboot and nobody remembers why the
-   machine got slow. wattwright restores clocks in a `finally`, on `SIGTERM` and on `SIGINT`, and
-   refuses to measure next to another GPU process unless you pass `--force`.
+   machine got slow. wattwright restores clocks in a `finally`, on `SIGTERM` and on `SIGINT`; a
+   second signal cannot interrupt the cleanup; if one card fails to apply, the ones already
+   changed are rolled back rather than left half-locked; and if a restore fails you are told
+   which card and how to fix it by hand.
 
-There is also a hard stop: any card reaching **84 °C** aborts that point and restores the clocks.
+Two more guarantees worth knowing about:
+
+- **The temperature limit watches the whole time the clock is locked** — the settle after a clock
+  change and the sampling window alike, not just the sampling. A card reaching **84 °C** ends that
+  point and frees the clocks before moving on. The settle is exactly when a thermal overshoot is
+  most likely, so watching only the sampling window was watching the wrong minute.
+- **Measurements are written after every point.** A sweep is hours; a failure on the last point
+  used to throw away all the earlier ones.
 
 ## Commands
 
@@ -100,13 +111,17 @@ wattwright measure    # run the sweep, write wattwright.json
     --model NAME      model to ask the server for
     --clock 2700 2400 2100 1800 1500      clocks to try
     --settle 90 --window 30 --tokens 400
-    --force           measure even if the GPU is busy
 
 wattwright profiles   # derive and print the profiles (works with no GPU present)
 wattwright set NAME   # apply a profile, or a raw MHz value: `set 2550`
 wattwright status     # clocks, watts, temperature, fans right now
 wattwright install NAME [--show]    # systemd unit so the profile survives reboot
+wattwright install power            # ...and this removes it again
 ```
+
+Your inference server is itself a process on the GPU, so wattwright lists what is running and
+carries on. It does not refuse: it tells you what it found, because *another* workload alongside
+it is what would quietly poison every number.
 
 `profiles` deliberately needs no driver: a measurement file can be read, shared and compared on
 any machine.
@@ -123,6 +138,10 @@ Changing clocks needs root. Reading measurements does not.
 ## Scope and limits
 
 - **NVIDIA only**, through `nvidia-smi -lgc`. AMD exposes different levers.
+- **The reading column needs token counts.** llama.cpp reports prompt-processing speed directly;
+  for other backends it is computed from `usage.prompt_tokens` and the wall clock. If a server
+  reports neither, the column says `n/a` — never `0`, which would read as "infinitely slow at
+  reading" and is indistinguishable from a real measurement.
 - **Power limits are a separate lever and often a dead one**: on the box above, the VBIOS floor
   was 250 W while the cards drew 248 W under load, so capping power changed nothing measurable
   (−1.2 W, −0.02% tokens/s). Clock locking did the work instead. Check your own floor with
@@ -134,6 +153,20 @@ Changing clocks needs root. Reading measurements does not.
 - The profile applies to **the whole machine**. If you also run image or video generation, those
   are more compute-bound than token generation and will pay more than your `tok/s` column
   suggests — measure them before making a low clock your default.
+
+## How this is tested
+
+`python3 tests/test_wattwright.py` — no GPU, no `nvidia-smi`, no endpoint required.
+
+The suite is checked by **mutation**: every guarantee above has a deliberate break that must turn
+the suite red. Deleting the temperature check, emptying the restore, dropping the rollback,
+removing the `join` that stops the load thread, turning a missing reading back into a zero, or
+comparing the percentage rule naively — each of those is verified to fail the tests.
+
+This matters because the first version of this suite tested only the profile arithmetic, and an
+adversarial review showed that removing the temperature limit *and* the clock restore left it
+entirely green. Tests that cover the safe, pure part of a program and skip the part that can brick
+someone's afternoon are worse than no tests: they are a reason not to look.
 
 ## Licence
 
