@@ -109,6 +109,13 @@ MUTATIONS: list[tuple[str, str, str]] = [
      '        value = Load.prefill_tps(load.request(f"{time.time_ns()} {prompt}", 1))',
      "        load.request(prompt, 1)\n"
      "        value = Load.prefill_tps(load.request(prompt, 1))"),
+
+    ("default clocks hardcoded for one model of card again",
+     "    return [int(round(top * f / 50)) * 50 for f in (0.9, 0.8, 0.7, 0.6, 0.5)]",
+     "    return [2700, 2400, 2100, 1800, 1500]"),
+
+    ("the ceiling is the fastest card instead of the slowest",
+     "    return min(tops) if tops else None", "    return max(tops) if tops else None"),
 ]
 
 

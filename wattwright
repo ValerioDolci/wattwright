@@ -21,7 +21,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 DATA_FILE = os.environ.get("WATTWRIGHT_DATA", "wattwright.json")
 UNIT_PATH = "/etc/systemd/system/wattwright.service"
 
@@ -76,6 +76,28 @@ def sample(indexes: list[int]) -> list[dict]:
     if absent:
         raise RuntimeError(f"no telemetry from GPU {absent}: is nvidia-smi failing?")
     return read
+
+
+def max_clock() -> int | None:
+    """The lowest of the cards' maximum SM clocks, since one value is applied to all."""
+    out = _smi("--query-gpu=clocks.max.sm", "--format=csv,noheader,nounits")
+    tops = []
+    for row in out.splitlines():
+        v = _num(row.strip())
+        if v:
+            tops.append(int(v))
+    return min(tops) if tops else None
+
+
+def default_clocks(top: int) -> list[int]:
+    """Points to try, as fractions of what THIS card can do.
+
+    A fixed list like 2700/2400/2100 is a Blackwell consumer list. On a card that
+    tops out at 1900 MHz most of it is unreachable, the sweep quietly measures
+    three points instead of six, and the profiles come out of a truncated curve.
+    Fractions travel between machines; megahertz do not.
+    """
+    return [int(round(top * f / 50)) * 50 for f in (0.9, 0.8, 0.7, 0.6, 0.5)]
 
 
 def gpu_processes() -> list[str]:
@@ -365,6 +387,27 @@ def cmd_measure(a) -> int:
     if not indexes:
         print("no NVIDIA GPU found", file=sys.stderr)
         return 2
+
+    top = max_clock()
+    if a.clock is None:
+        if top is None:
+            print("cannot read the maximum clock: pass --clock explicitly", file=sys.stderr)
+            return 2
+        a.clock = default_clocks(top)
+        print(f"clocks to try (from this card's {top} MHz maximum): "
+              + ", ".join(map(str, a.clock)), file=sys.stderr)
+    elif top is not None:
+        # Asking for more than the card can do is not an error, it is just a
+        # point that will never be reached: say so instead of measuring the same
+        # unlocked state several times and calling them different clocks.
+        over = [c for c in a.clock if c > top]
+        if over:
+            print(f"ignoring {', '.join(map(str, over))}: above this card's maximum "
+                  f"of {top} MHz", file=sys.stderr)
+            a.clock = [c for c in a.clock if c <= top]
+        if not a.clock:
+            print("no requested clock is reachable on this card", file=sys.stderr)
+            return 2
 
     # The inference server is itself a process on the GPU, so its presence is
     # expected and must not block the run. Showing the list is still worth it:
@@ -735,8 +778,8 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--endpoint", default="http://127.0.0.1:8080",
                    help="OpenAI-compatible server (default: %(default)s)")
     m.add_argument("--model", default="default", help="model name to ask the server for")
-    m.add_argument("--clock", type=int, nargs="+",
-                   default=[2700, 2400, 2100, 1800, 1500], help="clocks to try, in MHz")
+    m.add_argument("--clock", type=int, nargs="+", default=None,
+                   help="clocks to try, in MHz (default: 90/80/70/60/50%% of this card's maximum)")
     m.add_argument("--settle", type=int, default=90,
                    help="seconds to wait before sampling (default: %(default)s)")
     m.add_argument("--window", type=int, default=30, help="seconds of sampling per point")

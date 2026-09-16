@@ -9,14 +9,29 @@ not transfer between machines, so wattwright does not ship a recommended clock. 
 measurement, and then applies whatever your own numbers say.
 
 ```
-wattwright measure --endpoint http://127.0.0.1:8080 --model my-model
+sudo wattwright measure --endpoint http://127.0.0.1:8080 --model my-model
 wattwright profiles
-wattwright set quiet
-wattwright install eco        # make it the default at every boot
+sudo wattwright set quiet
+sudo wattwright install eco        # make it the default at every boot
 ```
 
-No dependencies, one file. All it needs is `nvidia-smi` and an OpenAI-compatible inference server
-(llama.cpp, vLLM, TGI, Ollama's compat endpoint, …).
+One file, no dependencies beyond the standard library. What you need:
+
+- **Python 3.8+** and **`nvidia-smi`** (any NVIDIA driver that supports `-lgc`, i.e. most of the
+  last decade of cards).
+- **An OpenAI-compatible inference server already running, with your model loaded** — llama.cpp,
+  vLLM, TGI, Ollama's compat endpoint. wattwright does not start one for you: it measures the
+  machine under the workload you actually run.
+- **root** for `measure`, `set` and `install`, because changing clocks does. `profiles` does not,
+  and does not even need a GPU.
+- `install` writes a **systemd** unit; on a machine without systemd, use `set` from your own
+  startup script instead.
+
+**The clocks it tries are derived from your card**, not from a list that happened to suit the
+machine this was written on: by default 90/80/70/60/50% of your maximum SM clock, rounded to
+50 MHz. On a 3090 MHz card that is 2800…1550; on a 1410 MHz one, 1250…700. Override with
+`--clock` if you want specific points — anything above what the card can do is reported and
+skipped rather than measured as a duplicate of the unlocked run.
 
 ---
 
@@ -115,7 +130,7 @@ Two more guarantees worth knowing about:
 wattwright measure    # run the sweep, write wattwright.json
     --endpoint URL    OpenAI-compatible server (default http://127.0.0.1:8080)
     --model NAME      model to ask the server for
-    --clock 2700 2400 2100 1800 1500      clocks to try
+    --clock 2800 2450 ...                 clocks to try (default: from your card's maximum)
     --settle 90 --window 30 --tokens 400
 
 wattwright profiles   # derive and print the profiles (works with no GPU present)

@@ -32,6 +32,14 @@ LOAD_DATA = ww.load_data      # the real ones: several tests replace them with s
 SAMPLE = ww.sample
 SMI = ww._smi
 MEASURE_PREFILL = ww.measure_prefill
+LOAD_CLASS = ww.Load
+
+# Several tests replace module globals. Anything replaced must be put back, or a
+# test starts depending on which ones ran before it - which is how this file once
+# had a test silently exercising a lambda instead of the code it was written for.
+def restore_globals():
+    ww.load_data, ww.sample, ww._smi = LOAD_DATA, SAMPLE, SMI
+    ww.measure_prefill, ww.Load = MEASURE_PREFILL, LOAD_CLASS
 
 
 def check(cond, msg):
@@ -626,7 +634,7 @@ def test_prefill_never_reuses_the_same_prompt():
     request was served from cache and reported a handful of processed tokens.
     Unit tests with stubs cannot see this - a stub has no cache.
     """
-    ww.measure_prefill = MEASURE_PREFILL      # the real one, not an earlier stub
+    restore_globals()
     seen: list[str] = []
 
     class Recording(DummyLoad):
@@ -643,6 +651,37 @@ def test_prefill_never_reuses_the_same_prompt():
 
 
 test_prefill_never_reuses_the_same_prompt()
+
+# ═══════════ 9. it has to work on someone else's card, not just ours ════════
+
+def test_default_clocks_follow_the_card():
+    restore_globals()
+    """A fixed 2700/2400/2100 list is a Blackwell consumer list. On a 1900 MHz
+    card most of it is unreachable and the curve comes out truncated without
+    anybody noticing."""
+    for top in (3090, 1897, 1410, 2040):
+        got = ww.default_clocks(top)
+        check(len(got) == 5, f"five points expected for a {top} MHz card, got {got}")
+        check(all(c < top for c in got), f"every point must be below {top}: {got}")
+        check(got == sorted(got, reverse=True), f"points must descend: {got}")
+        check(all(c % 50 == 0 for c in got), f"points should be round numbers: {got}")
+    check(ww.default_clocks(3090)[0] > ww.default_clocks(1410)[0],
+          "a faster card must get faster points")
+
+
+def test_max_clock_is_the_slowest_card():
+    """One clock is applied to every GPU, so the ceiling is the lowest maximum:
+    a mixed pair must not be asked for something half of it cannot do."""
+    restore_globals()
+    ww._smi = lambda *a: "3210\n3090"
+    check(ww.max_clock() == 3090, "with mixed cards the lower maximum wins")
+    ww._smi = lambda *a: "[N/A]"
+    check(ww.max_clock() is None, "an unreadable maximum is None, not a guess")
+    ww._smi = SMI
+
+
+test_default_clocks_follow_the_card()
+test_max_clock_is_the_slowest_card()
 
 print("FAILED:", failed) if failed else print("all ok")
 sys.exit(1 if failed else 0)
