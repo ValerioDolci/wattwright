@@ -1,0 +1,15 @@
+{
+  "wattwright": "0.1.0",
+  "when": "2026-09-16 09:55",
+  "gpu": ["NVIDIA GeForce RTX 5070 Ti", "NVIDIA GeForce RTX 5070 Ti"],
+  "model": "Qwen3.8-27B UD-Q4_K_XL, llama.cpp, tensor-split over 2 cards",
+  "note": "Real run on the machine wattwright was written for. The 1800 and 1500 MHz points come from a descending sweep: their fan values are an upper bound, which is exactly the trap the README warns about.",
+  "points": [
+    {"clock": null, "tps": 123.34, "prefill_tps": 2007, "watt_total": 504.7, "watt_per_gpu": {"0": 256.4, "1": 248.3}, "temp_mean": 74.4, "temp_max": 76, "fan_mean": 67, "fan_max": 81, "clock_real": 2833},
+    {"clock": 2700, "tps": 123.35, "prefill_tps": 1973, "watt_total": 465.0, "watt_per_gpu": {"0": 224.0, "1": 241.0}, "temp_mean": 72.1, "temp_max": 74, "fan_mean": 63, "fan_max": 78, "clock_real": 2666},
+    {"clock": 2400, "tps": 117.17, "prefill_tps": 1838, "watt_total": 366.8, "watt_per_gpu": {"0": 177.7, "1": 189.1}, "temp_mean": 68.1, "temp_max": 70, "fan_mean": 52, "fan_max": 63, "clock_real": 2381},
+    {"clock": 2100, "tps": 105.11, "prefill_tps": 1655, "watt_total": 302.7, "watt_per_gpu": {"0": 148.1, "1": 154.6}, "temp_mean": 65.7, "temp_max": 67, "fan_mean": 44, "fan_max": 51, "clock_real": 2048},
+    {"clock": 1800, "tps": 92.74, "prefill_tps": null, "watt_total": 271.7, "watt_per_gpu": {"0": 133.1, "1": 138.6}, "temp_mean": 59.4, "temp_max": 61, "fan_mean": 47, "fan_max": 53, "clock_real": 1771},
+    {"clock": 1500, "tps": 79.49, "prefill_tps": null, "watt_total": 240.8, "watt_per_gpu": {"0": 118.2, "1": 122.6}, "temp_mean": 58.6, "temp_max": 60, "fan_mean": 40, "fan_max": 44, "clock_real": 1489}
+  ]
+}

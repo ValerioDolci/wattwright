@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""wattwright - measure YOUR machine's clock/watt/token curve and derive profiles from it.
+
+Performance-per-watt numbers do not transfer between machines: they depend on the
+card, the cooling, the chassis and the workload. This tool does not tell you which
+clock to run at - it makes you measure it, then applies the result with one command.
+
+No dependencies: all you need is `nvidia-smi` and an OpenAI-compatible inference server.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+VERSION = "0.1.0"
+DATA_FILE = os.environ.get("WATTWRIGHT_DATA", "wattwright.json")
+UNIT = "/etc/systemd/system/wattwright.service"
+
+# Thresholds that define the profiles. These are declared rules, not taste:
+# they are applied to YOUR numbers and they are documented in the README.
+FREE_RATIO = 0.99        # the lowest clock that still keeps 99% of the tokens/s
+QUIET_RATIO = 0.95       # ... and 95%
+TEMP_ABORT = 84          # deg C: above this the point is dropped and clocks restored
+
+
+# ------------------------------- telemetry -------------------------------
+
+def _smi(*args: str) -> str:
+    return subprocess.run(["nvidia-smi", *args], capture_output=True, text=True).stdout.strip()
+
+
+def gpu_indexes() -> list[int]:
+    out = _smi("--query-gpu=index", "--format=csv,noheader")
+    return [int(r) for r in out.splitlines() if r.strip()]
+
+
+def sample(indexes: list[int]) -> list[dict]:
+    """One reading of clock, watts, temperature and fan for every GPU."""
+    fields = "index,clocks.gr,power.draw,temperature.gpu,fan.speed"
+    read = []
+    for row in _smi(f"--query-gpu={fields}", "--format=csv,noheader,nounits").splitlines():
+        p = [x.strip() for x in row.split(",")]
+        if len(p) < 5 or int(p[0]) not in indexes:
+            continue
+
+        def num(x: str) -> float:
+            try:
+                return float(x)
+            except ValueError:
+                return 0.0      # [N/A]: some cards expose no fan reading at all
+
+        read.append({"i": int(p[0]), "clock": num(p[1]), "watt": num(p[2]),
+                     "temp": num(p[3]), "fan": num(p[4])})
+    return read
+
+
+def gpu_busy() -> list[str]:
+    out = _smi("--query-compute-apps=pid,process_name", "--format=csv,noheader")
+    return [r for r in out.splitlines() if r.strip()]
+
+
+# --------------------------------- levers ---------------------------------
+
+def clock_lock(indexes: list[int], mhz: int | None) -> None:
+    for i in indexes:
+        args = ["-i", str(i)] + (["-rgc"] if mhz is None else ["-lgc", str(mhz)])
+        r = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"nvidia-smi {' '.join(args)}: "
+                               f"{r.stderr.strip() or r.stdout.strip()}")
+
+
+class Restore:
+    """Clocks go back to free whatever happens: exception, Ctrl-C or SIGTERM.
+
+    This is not a detail. A clock lock left behind by a dead process stays on the
+    card until the next reboot, and nobody remembers why the machine got slow.
+    """
+
+    def __init__(self, indexes: list[int]):
+        self.indexes = indexes
+        self._previous: dict = {}
+
+    def __enter__(self):
+        for s in (signal.SIGTERM, signal.SIGINT):
+            self._previous[s] = signal.signal(s, self._on_signal)
+        return self
+
+    def _on_signal(self, *_):
+        raise KeyboardInterrupt
+
+    def __exit__(self, *exc):
+        try:
+            clock_lock(self.indexes, None)
+            print("clocks restored to free", file=sys.stderr)
+        except Exception as e:                                   # noqa: BLE001
+            print(f"WARNING: restore failed: {e}", file=sys.stderr)
+        for s, h in self._previous.items():
+            signal.signal(s, h)
+        return False
+
+
+# ---------------------------------- load ----------------------------------
+
+class Load:
+    """Load generator against an OpenAI-compatible endpoint.
+
+    Reads tokens/s from the `timings` field when the server provides one
+    (llama.cpp), otherwise times the request and uses the token count from
+    `usage`. It runs in a thread, so telemetry is sampled WHILE the GPU is
+    working rather than after it went idle.
+    """
+
+    def __init__(self, endpoint: str, model: str, tokens: int = 400):
+        self.url = endpoint.rstrip("/") + "/v1/completions"
+        self.model, self.tokens = model, tokens
+        self.stop = threading.Event()
+        self.samples: list[tuple[float, float]] = []      # (finished_at, tokens/s)
+        self._lock = threading.Lock()
+        self._error: str | None = None
+        self._thread: threading.Thread | None = None
+
+    def _one(self, prompt: str, tokens: int) -> tuple[float, float]:
+        body = json.dumps({"model": self.model, "prompt": prompt, "max_tokens": tokens,
+                           "temperature": 0, "stream": False}).encode()
+        req = urllib.request.Request(self.url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=600) as r:
+            d = json.load(r)
+        dt = time.time() - t0
+        t = d.get("timings") or {}
+        if t.get("predicted_per_second"):
+            return t["predicted_per_second"], t.get("prompt_per_second", 0.0)
+        n = (d.get("usage") or {}).get("completion_tokens", tokens)
+        return (n / dt if dt else 0.0), 0.0
+
+    def prefill(self, prompt: str) -> float:
+        """Prompt-reading tokens/s, measured on its own: it is compute-bound and
+        it degrades differently from generation. Measuring only decode hides that."""
+        self._one(prompt, 8)                       # warm up, then keep the second
+        _, p = self._one(prompt, 8)
+        return p
+
+    def start(self) -> None:
+        def loop():
+            while not self.stop.is_set():
+                try:
+                    tps, _ = self._one("Once upon a time in a distant land", self.tokens)
+                    with self._lock:
+                        self.samples.append((time.time(), tps))
+                except Exception as e:                           # noqa: BLE001
+                    self._error = f"{type(e).__name__}: {e}"
+                    time.sleep(2)
+        self.stop.clear()
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop_load(self) -> None:
+        self.stop.set()
+
+    def mean_since(self, moment: float) -> tuple[float | None, int]:
+        with self._lock:
+            v = [t for ts, t in self.samples if ts >= moment]
+        return (statistics.fmean(v) if v else None), len(v)
+
+    def check(self) -> None:
+        if self._error:
+            raise RuntimeError(f"the endpoint is not answering - {self._error}")
+
+
+# -------------------------------- measure --------------------------------
+
+def measure_point(indexes: list[int], load: Load, mhz: int | None,
+                  settle: int, window: int) -> dict:
+    """One point of the curve: apply the clock, WAIT, then sample.
+
+    The wait is not politeness. A GPU read during the ramp gives numbers that do
+    not exist - temperatures and fans in transit - and fans coming DOWN stay high
+    out of inertia, so a descending sweep reports fan values that are an upper
+    bound rather than the equilibrium. Every point here starts settled.
+    """
+    clock_lock(indexes, mhz)
+    time.sleep(settle)
+    t0 = time.time()
+    reads: list[list[dict]] = []
+    while time.time() - t0 < window:
+        s = sample(indexes)
+        for g in s:
+            if g["temp"] >= TEMP_ABORT:
+                raise RuntimeError(f"ABORT: GPU{g['i']} at {g['temp']:.0f} C "
+                                   f"(limit {TEMP_ABORT})")
+        reads.append(s)
+        load.check()
+        time.sleep(2)
+    tps, n = load.mean_since(t0)
+
+    def agg(key: str, f=statistics.fmean) -> float:
+        return round(f([g[key] for s in reads for g in s]), 1)
+
+    # Watts are SUMMED across cards (it is what the machine draws); everything
+    # else is averaged. The mean of two cards' wattage means nothing.
+    per_gpu = {i: statistics.fmean([g["watt"] for s in reads for g in s if g["i"] == i])
+               for i in indexes}
+    return {"clock": mhz, "tps": round(tps, 2) if tps else None, "load_samples": n,
+            "watt_total": round(sum(per_gpu.values()), 1),
+            "watt_per_gpu": {str(i): round(w, 1) for i, w in per_gpu.items()},
+            "temp_mean": agg("temp"), "temp_max": agg("temp", max),
+            "fan_mean": agg("fan"), "fan_max": agg("fan", max),
+            "clock_real": agg("clock")}
+
+
+def cmd_measure(a) -> int:
+    busy = gpu_busy()
+    if busy:
+        print("GPU already in use by: " + "; ".join(busy), file=sys.stderr)
+        print("A measurement taken next to another GPU process is worthless. "
+              "Stop it, or pass --force.", file=sys.stderr)
+        if not a.force:
+            return 2
+    indexes = gpu_indexes()
+    if not indexes:
+        print("no NVIDIA GPU found", file=sys.stderr)
+        return 2
+
+    load = Load(a.endpoint, a.model, a.tokens)
+    long_prompt = "This sentence is here to fill the context so reading can be measured. " * 400
+    results: list[dict] = []
+    print(f"wattwright {VERSION} - {len(indexes)} GPU(s) - endpoint {a.endpoint} "
+          f"- model {a.model}", file=sys.stderr)
+
+    with Restore(indexes):
+        load.start()
+        print("warming up for 60 s before the first point...", file=sys.stderr)
+        time.sleep(60)
+        for mhz in [None] + list(a.clock):
+            label = "free" if mhz is None else f"{mhz} MHz"
+            print(f"  point {label} (settling {a.settle} s)...", file=sys.stderr, flush=True)
+            try:
+                r = measure_point(indexes, load, mhz, a.settle, a.window)
+            except RuntimeError as e:
+                print(f"  ! {e} - point dropped", file=sys.stderr)
+                continue
+            load.stop_load()
+            time.sleep(2)
+            r["prefill_tps"] = round(load.prefill(long_prompt), 1)
+            load.start()
+            results.append(r)
+            print(f"    {r['tps']} tok/s - {r['prefill_tps']} tok/s reading - "
+                  f"{r['watt_total']} W - {r['temp_mean']} C - fan {r['fan_mean']}%",
+                  file=sys.stderr)
+        load.stop_load()
+
+    data = {"wattwright": VERSION, "when": time.strftime("%Y-%m-%d %H:%M"),
+            "gpu": _smi("--query-gpu=name", "--format=csv,noheader").splitlines(),
+            "model": a.model, "points": results}
+    with open(a.out, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"\nwrote {a.out} - now run: wattwright profiles", file=sys.stderr)
+    return 0
+
+
+# -------------------------------- profiles --------------------------------
+
+def derive(data: dict) -> dict[str, dict]:
+    """Turn YOUR numbers into profiles, with rules that are stated up front.
+
+    power = no lock
+    free  = the lowest clock that still keeps 99% of the tokens/s
+    quiet = the lowest clock that still keeps 95%
+    eco   = the highest tokens per watt
+
+    Two rules can land on the same clock. That is information, not a problem:
+    every name stays usable on the command line and the table groups them on a
+    single row, so you can see that one point is both the quietest acceptable
+    one and the most efficient, instead of one of them being hidden.
+    """
+    points = [p for p in data.get("points", []) if p.get("tps")]
+    if not points:
+        return {}
+    free_run = next((p for p in points if p["clock"] is None),
+                    max(points, key=lambda p: p["tps"]))
+    locked = sorted((p for p in points if p["clock"]), key=lambda p: p["clock"])
+    prof: dict[str, dict] = {"power": free_run}
+    for name, ratio in (("free", FREE_RATIO), ("quiet", QUIET_RATIO)):
+        # Compare on the SAME rounded percentage the table prints. Otherwise a
+        # point shown as "95%" can be rejected by a 95% rule for a thousandth
+        # (measured: 117.17 / 123.34 = 94.997%), and the tool contradicts itself.
+        ok = [p for p in locked
+              if round(p["tps"] / free_run["tps"] * 100) >= round(ratio * 100)]
+        if ok:
+            prof[name] = min(ok, key=lambda p: p["clock"])
+    if locked:
+        prof["eco"] = max(locked, key=lambda p: p["tps"] / max(p["watt_total"], 1e-9))
+    return prof
+
+
+def load_data(path: str) -> dict:
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} not found: run `wattwright measure` first")
+    with open(path) as f:
+        return json.load(f)
+
+
+def cmd_profiles(a) -> int:
+    data = load_data(a.data)
+    prof = derive(data)
+    if not prof:
+        print("no usable point in the measurements", file=sys.stderr)
+        return 1
+    ref = prof["power"]
+    print(f"measured {data.get('when')} - {', '.join(data.get('gpu', []))} "
+          f"- model {data.get('model')}\n")
+    groups: dict[object, list[str]] = {}
+    for name, p in prof.items():          # one row per clock, all names that land on it
+        groups.setdefault(p["clock"], []).append(name)
+    print(f"{'profile':22} {'clock':>8} {'tok/s':>14} {'reading':>9} "
+          f"{'watts':>13} {'C':>5} {'fan':>6}")
+    for clock_value, names in groups.items():
+        p = prof[names[0]]
+        name = " / ".join(names)
+        clock = "free" if clock_value is None else str(clock_value)
+        share = f"{p['tps'] / ref['tps'] * 100:.0f}%"
+        watts = f"{p['watt_total'] / ref['watt_total'] * 100:.0f}%"
+        print(f"{name:22} {clock:>8} {p['tps']:>8.1f} {share:>5} "
+              f"{p.get('prefill_tps', 0):>8.0f} {p['watt_total']:>8.0f} {watts:>5} "
+              f"{p['temp_mean']:>4.0f} {p['fan_mean']:>5.0f}%")
+    print(f"\nrules: free = slowest clock keeping {FREE_RATIO:.0%} of tokens/s"
+          f" - quiet = {QUIET_RATIO:.0%} - eco = highest tokens per watt")
+    return 0
+
+
+def resolve(data: dict, name: str) -> int | None:
+    if name in ("power", "free-clock", "none"):
+        return None
+    if name.isdigit():
+        return int(name)
+    prof = derive(data)
+    if name not in prof:
+        raise SystemExit(f"unknown profile: {name} (I have {', '.join(prof)})")
+    return prof[name]["clock"]
+
+
+def cmd_set(a) -> int:
+    data = {} if a.profile.isdigit() else load_data(a.data)
+    mhz = resolve(data, a.profile)
+    clock_lock(gpu_indexes(), mhz)
+    print(f"profile {a.profile}: clock {'free' if mhz is None else str(mhz) + ' MHz'}")
+    return 0
+
+
+def cmd_status(a) -> int:
+    for g in sample(gpu_indexes()):
+        print(f"GPU{g['i']}  {g['clock']:>5.0f} MHz  {g['watt']:>6.1f} W  "
+              f"{g['temp']:>3.0f} C  fan {g['fan']:>3.0f}%")
+    if os.path.exists(UNIT):
+        print(f"\nboot profile installed: {UNIT}")
+    return 0
+
+
+# ---------------------------------- boot ----------------------------------
+
+UNIT_TEMPLATE = """# Generated by wattwright - profile "{name}" ({clock})
+# The clock lock is a runtime setting: without this unit the machine goes back
+# to free clocks on every reboot.
+[Unit]
+Description=wattwright - GPU operating point ({name})
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+{start}
+{stop}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cmd_install(a) -> int:
+    mhz = resolve(load_data(a.data), a.profile)
+    if mhz is None:
+        print('"power" is already the default behaviour: no unit needed.')
+        return 0
+    smi = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
+    indexes = gpu_indexes()
+    text = UNIT_TEMPLATE.format(
+        name=a.profile, clock=f"{mhz} MHz",
+        start="\n".join(f"ExecStart={smi} -i {i} -lgc {mhz}" for i in indexes),
+        stop="\n".join(f"ExecStop={smi} -i {i} -rgc" for i in indexes))
+    if a.show:
+        print(text)
+        return 0
+    try:
+        with open(UNIT, "w") as f:
+            f.write(text)
+    except PermissionError:
+        print(f"root privileges are needed to write {UNIT}", file=sys.stderr)
+        return 2
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "wattwright"], check=False)
+    print(f'profile "{a.profile}" ({mhz} MHz) is now applied at every boot.')
+    print(f"to remove it: systemctl disable --now wattwright && rm {UNIT}")
+    return 0
+
+
+# ----------------------------------- cli -----------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="wattwright",
+        description="Measure your machine's clock/watt/token curve and apply the profiles.",
+        epilog="Another machine's numbers do not apply to yours: measure, then choose.")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    m = sub.add_parser("measure", help="run the sweep and write the measurements")
+    m.add_argument("--endpoint", default="http://127.0.0.1:8080",
+                   help="OpenAI-compatible server (default: %(default)s)")
+    m.add_argument("--model", default="default", help="model name to ask the server for")
+    m.add_argument("--clock", type=int, nargs="+",
+                   default=[2700, 2400, 2100, 1800, 1500], help="clocks to try, in MHz")
+    m.add_argument("--settle", type=int, default=90,
+                   help="seconds to wait before sampling (default: %(default)s)")
+    m.add_argument("--window", type=int, default=30, help="seconds of sampling per point")
+    m.add_argument("--tokens", type=int, default=400, help="tokens generated per request")
+    m.add_argument("--out", default=DATA_FILE)
+    m.add_argument("--force", action="store_true", help="measure even if the GPU is busy")
+    m.set_defaults(func=cmd_measure)
+
+    f = sub.add_parser("profiles", help="show the profiles derived from the measurements")
+    f.add_argument("--data", default=DATA_FILE)
+    f.set_defaults(func=cmd_profiles)
+
+    s = sub.add_parser("set", help="apply a profile (or a raw MHz value)")
+    s.add_argument("profile")
+    s.add_argument("--data", default=DATA_FILE)
+    s.set_defaults(func=cmd_set)
+
+    t = sub.add_parser("status", help="clocks, watts, temperature and fans right now")
+    t.set_defaults(func=cmd_status)
+
+    i = sub.add_parser("install", help="make a profile the default at every boot")
+    i.add_argument("profile")
+    i.add_argument("--data", default=DATA_FILE)
+    i.add_argument("--show", action="store_true", help="print the unit instead of installing it")
+    i.set_defaults(func=cmd_install)
+
+    a = p.parse_args(argv)
+    # Only the commands that actually touch the GPU need the driver: reading a
+    # measurement file must work anywhere, so curves can be shared and compared.
+    if a.cmd in ("measure", "set", "status", "install") and not shutil.which("nvidia-smi"):
+        print("nvidia-smi not found: the NVIDIA driver is required for "
+              f"`{a.cmd}` (`profiles` works without it).", file=sys.stderr)
+        return 2
+    try:
+        return a.func(a)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,140 @@
+# wattwright
+
+Measure **your** machine's clock / watt / token curve, then run it at the point you actually want.
+
+GPUs ship tuned for benchmark scores, not for a box that generates tokens all day in a room
+where somebody works. Capping the clock usually buys a lot of watts and quiet for very little
+throughput — but *how much* is a property of your card, your cooling and your workload. It does
+not transfer between machines, so wattwright does not ship a recommended clock. It ships the
+measurement, and then applies whatever your own numbers say.
+
+```
+wattwright measure --endpoint http://127.0.0.1:8080 --model my-model
+wattwright profiles
+wattwright set quiet
+wattwright install eco        # make it the default at every boot
+```
+
+No dependencies, one file. All it needs is `nvidia-smi` and an OpenAI-compatible inference server
+(llama.cpp, vLLM, TGI, Ollama's compat endpoint, …).
+
+---
+
+## What it produces
+
+Real output from a 2× RTX 5070 Ti box running Qwen3.8-27B on llama.cpp, tensor-split:
+
+```
+profile                   clock          tok/s   reading         watts     C    fan
+power                      free    123.3  100%     2007      505  100%   74    67%
+free                       2700    123.3  100%     1973      465   92%   72    63%
+quiet                      2400    117.2   95%     1838      367   73%   68    52%
+eco                        2100    105.1   85%     1655      303   60%   66    44%
+```
+
+Read that table and the decision makes itself: on this machine **2700 MHz is free** — 8% fewer
+watts for 0.1% fewer tokens, there is no reason not to. Going to 2400 buys real quiet for 5%.
+Going to 2100 halves the fan and cuts 40% of the power for 15%.
+
+That is *this* box. Yours will differ — that is the entire point.
+
+## The rules
+
+Profiles are derived from your measurements by rules that are stated up front, not chosen after
+looking at the numbers:
+
+| profile | rule |
+|---|---|
+| `power` | no clock lock at all |
+| `free`  | the **lowest** clock that still keeps **99%** of the tokens/s |
+| `quiet` | the **lowest** clock that still keeps **95%** |
+| `eco`   | the **highest tokens per watt** |
+
+Two rules can land on the same clock — that is information, not a collision. Both names stay
+usable and the table groups them on one row. On a compute-bound curve, where throughput falls in
+proportion to the clock, `free` and `quiet` simply **do not exist** and the tool says so instead
+of inventing a recommendation.
+
+Thresholds are compared on the same **rounded** percentage the table prints. A point displayed as
+`95%` qualifies for a 95% rule. Without that, a real measurement of 94.997% gets rejected for a
+thousandth while the screen says it passed.
+
+## What it measures, and why that way
+
+- **Generation and reading separately.** Prompt processing is compute-bound and degrades *more*
+  than decoding at the same clock — on the box above, −17% against −15% at 2100 MHz. A tool that
+  only reports tokens/s hides the cost on long documents, which is where you actually wait.
+- **At equilibrium, never during the ramp.** Each point applies the clock, waits (90 s by
+  default), and only then samples for 30 s. A GPU read while it is still settling reports numbers
+  that do not exist.
+- **Load running during the sample.** Telemetry is read *while* the endpoint is being hammered,
+  from a separate thread — not before, not after.
+- **Watts summed across cards, everything else averaged.** The mean wattage of two cards is not a
+  quantity.
+
+## Three traps this tool is built around
+
+They all cost real measurements before the rules above existed.
+
+1. **Fans have inertia coming down.** Sweeping from high clock to low leaves fans spinning fast
+   from the previous, hotter point: the fan column of a descending sweep is an *upper bound*, not
+   an equilibrium. The same machine reported 78% at 2400 MHz during a descending sweep and **63%**
+   when the point was measured from settled. wattwright settles every point before sampling; if
+   you write your own sweep, do the same.
+2. **Cold versus warm invalidates everything.** Benchmarking an image job at free clock first and
+   at a locked clock second made the *locked* run look 40% faster — the first run was paying for
+   model loading. Any comparison where one arm loads something the other has cached is measuring
+   the load, not the clock.
+3. **A lock left behind outlives the process.** `nvidia-smi -lgc` is not scoped to your program:
+   if the process dies, the lock stays on the card until reboot and nobody remembers why the
+   machine got slow. wattwright restores clocks in a `finally`, on `SIGTERM` and on `SIGINT`, and
+   refuses to measure next to another GPU process unless you pass `--force`.
+
+There is also a hard stop: any card reaching **84 °C** aborts that point and restores the clocks.
+
+## Commands
+
+```
+wattwright measure    # run the sweep, write wattwright.json
+    --endpoint URL    OpenAI-compatible server (default http://127.0.0.1:8080)
+    --model NAME      model to ask the server for
+    --clock 2700 2400 2100 1800 1500      clocks to try
+    --settle 90 --window 30 --tokens 400
+    --force           measure even if the GPU is busy
+
+wattwright profiles   # derive and print the profiles (works with no GPU present)
+wattwright set NAME   # apply a profile, or a raw MHz value: `set 2550`
+wattwright status     # clocks, watts, temperature, fans right now
+wattwright install NAME [--show]    # systemd unit so the profile survives reboot
+```
+
+`profiles` deliberately needs no driver: a measurement file can be read, shared and compared on
+any machine.
+
+## Install
+
+```bash
+curl -O https://raw.githubusercontent.com/ValerioDolci/wattwright/main/wattwright
+chmod +x wattwright && sudo mv wattwright /usr/local/bin/
+```
+
+Changing clocks needs root. Reading measurements does not.
+
+## Scope and limits
+
+- **NVIDIA only**, through `nvidia-smi -lgc`. AMD exposes different levers.
+- **Power limits are a separate lever and often a dead one**: on the box above, the VBIOS floor
+  was 250 W while the cards drew 248 W under load, so capping power changed nothing measurable
+  (−1.2 W, −0.02% tokens/s). Clock locking did the work instead. Check your own floor with
+  `nvidia-smi --query-gpu=power.min_limit --format=csv` before reaching for that knob.
+- **Fan control is not here on purpose.** On the machine this was built for, a custom fan curve
+  turned out to be both impractical at full power (60% duty → 81 °C) and unnecessary at reduced
+  clock, because the automatic curve drops below any duty you would have forced once the card
+  stops producing that heat. Lower the watts and the fans follow.
+- The profile applies to **the whole machine**. If you also run image or video generation, those
+  are more compute-bound than token generation and will pay more than your `tok/s` column
+  suggests — measure them before making a low clock your default.
+
+## Licence
+
+MIT.
